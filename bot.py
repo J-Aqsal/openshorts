@@ -50,6 +50,8 @@ async def run_processing_logic(cmd, update: Update, job_id, job_output_dir, stat
             stderr=asyncio.subprocess.STDOUT
         )
 
+        last_update_text = ""
+        
         # We consume output to log it, but we DON'T wait for it in a way that blocks Telegram
         while True:
             chunk = await process.stdout.read(4096)
@@ -58,14 +60,45 @@ async def run_processing_logic(cmd, update: Update, job_id, job_output_dir, stat
             decoded = chunk.decode(errors='ignore').strip()
             if decoded:
                 for line in decoded.split('\n'):
-                    logging.info(f"[{job_id}] {line.strip()}")
-        
+                    clean_line = line.strip()
+                    logging.info(f"[{job_id}] {clean_line}")
+                    
+                    # --- Live Status Updates ---
+                    update_text = None
+                    if "Transcribing video" in clean_line:
+                        update_text = "🎙️ **Mentranskrip video...** (Proses ini mungkin memakan waktu)"
+                    elif "Analyzing with Gemini" in clean_line:
+                        update_text = "🤖 **Menganalisis viralitas dengan Gemini AI...**"
+                    elif "Found" in clean_line and "viral clips!" in clean_line:
+                        num_clips = "".join(filter(str.isdigit, clean_line))
+                        update_text = f"🔥 **Ditemukan {num_clips} klip viral!** Memulai proses rendering..."
+                    elif "Processing Clip" in clean_line:
+                        clip_num = clean_line.split("Clip")[-1].split(":")[0].strip()
+                        update_text = f"🎬 **Merender Klip {clip_num}...**\n\n_Proses ini berat dan memakan waktu, mohon tunggu sebentar ya..._"
+                    elif "Clip" in clean_line and "ready" in clean_line:
+                        clip_num = clean_line.split("Clip")[-1].split("ready")[0].strip()
+                        update_text = f"✅ **Klip {clip_num} selesai dirender!**"
+                    elif "Gemini is busy" in clean_line:
+                        update_text = "⚠️ **Server Gemini sedang sibuk.** Mencoba ulang otomatis..."
+                    elif "Fast Mode: Skipping scene detection" in clean_line:
+                        update_text = "⏩ **Mode Test Aktif:** Melewati analisis AI dan langsung merender 30 detik pertama..."
+
+                    if update_text and update_text != last_update_text:
+                        try:
+                            last_update_text = update_text
+                            full_msg = f"🚀 **Progress Update (ID: `{job_id}`)**\n\n{update_text}"
+                            await status_message.edit_text(full_msg, parse_mode='Markdown')
+                        except Exception as e:
+                            # Ignore Telegram rate limits or "message is not modified" errors
+                            logging.debug(f"Status update failed: {e}")
+
         await process.wait()
         
         if process.returncode == 0:
             # Check for clips or test video
             json_files = glob.glob(os.path.join(job_output_dir, "*_metadata.json"))
             test_files = glob.glob(os.path.join(job_output_dir, "*_test_vertical.mp4"))
+            fallback_files = [f for f in glob.glob(os.path.join(job_output_dir, "*_vertical.mp4")) if not f.endswith("_test_vertical.mp4")]
             
             if test_files:
                 # Handle test mode result
@@ -100,6 +133,17 @@ async def run_processing_logic(cmd, update: Update, job_id, job_output_dir, stat
                             )
                 
                 await status_message.edit_text("✅ Semua clip berhasil dikirim!")
+            elif fallback_files:
+                # Handle fallback (Gemini failed, whole video converted)
+                with open(fallback_files[0], 'rb') as vf:
+                    await update.message.reply_document(
+                        document=vf, 
+                        caption="⚠️ **Analisis AI Gagal (Server Sibuk).**\n\nBerikut adalah hasil konversi vertikal dari keseluruhan video Anda sebagai fallback.", 
+                        parse_mode='Markdown',
+                        read_timeout=600,
+                        write_timeout=600
+                    )
+                await status_message.delete()
             else:
                 await status_message.edit_text("❌ Proses selesai tapi file tidak ditemukan.")
         else:
