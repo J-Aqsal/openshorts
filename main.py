@@ -386,9 +386,9 @@ def analyze_scenes_strategy(video_path, scenes):
     for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
         # Sample 3 frames (start, middle, end)
         frames_to_check = [
-            start.get_frames() + 5,
-            int((start.get_frames() + end.get_frames()) / 2),
-            end.get_frames() - 5
+            start.frame_num + 5,
+            int((start.frame_num + end.frame_num) / 2),
+            end.frame_num - 5
         ]
         
         face_counts = []
@@ -448,134 +448,116 @@ def sanitize_filename(filename):
 
 def download_youtube_video(url, output_dir="."):
     """
-    Downloads a YouTube video using yt-dlp.
-    Returns the path to the downloaded video and the video title.
+    Downloads a YouTube video using yt-dlp, matching the user's preferred implementation for Windows and Linux.
     """
-    print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
-    print("📥 Downloading video from YouTube...")
-    step_start_time = time.time()
-
+    os.makedirs(output_dir, exist_ok=True)
     cookies_path = '/app/cookies.txt'
+    
+    # Handle cookies (Keep the existing cookie logic but adapted to the new structure)
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
     if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
         try:
             with open(cookies_path, 'w') as f:
                 f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-                 with open(cookies_path, 'r') as f:
-                     content = f.read(100)
-                     print(f"   Debug: First 100 chars of cookie file: {content}")
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
     else:
-        cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
-    
-    # Common yt-dlp options to work around YouTube bot detection.
-    # extractor_args tries multiple player clients in order; tv_embed / android
-    # avoid the OAuth/PO-token checks that block server IPs.
-    _COMMON_YDL_OPTS = {
-        'quiet': False,
-        'verbose': True,
-        'no_warnings': False,
-        'cookiefile': cookies_path if cookies_path else None,
-        'socket_timeout': 30,
-        'retries': 10,
-        'fragment_retries': 10,
-        'nocheckcertificate': True,
-        'cachedir': False,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv_embed', 'android', 'mweb', 'web'],
-                'player_skip': ['webpage', 'configs'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            ),
-        },
-    }
+        # Fallback to local cookies.txt if exists
+        if not os.path.exists(cookies_path):
+             cookies_path = "cookies.txt"
+        if not os.path.exists(cookies_path):
+             cookies_path = None
 
-    with yt_dlp.YoutubeDL(_COMMON_YDL_OPTS) as ydl:
-        try:
+    # Quality Selection: Force H.264 (avc1) to ensure compatibility with OpenCV/MediaPipe
+    # We avoid AV1 and VP9 because they often fail in headless Docker environments.
+    quality_format = "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[vcodec^=avc1]/best"
+
+    if os.name == "nt":
+        print("🖥️ Windows detected, using Python API for download...")
+        ydl_opts = {
+            "outtmpl": f"{output_dir}/%(id)s.%(ext)s",
+            "format": quality_format,
+            "merge-output-format": "mp4",
+            "cookies": cookies_path,
+            "verbose": True,
+            "retries": 5,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Get metadata
             info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'youtube_video')
-            sanitized_title = sanitize_filename(video_title)
-        except Exception as e:
-            # Force print to stderr/stdout immediately so it's captured before crash
-            import sys
-            import traceback
+            video_id = info.get("id")
+            video_title = sanitize_filename(info.get("title", "Unknown"))
+            video_path = os.path.join(output_dir, f"{video_id}.mp4")
             
-            # Print minimal error first to ensure something gets out
-            print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
+            # Download
+            ydl.download([url])
             
-            error_msg = f"""
-            
-❌ ================================================================= ❌
-❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED
-❌ ================================================================= ❌
-            
-REASON: YouTube has blocked the download request (Error 429/Unavailable).
-        This is likely a temporary IP ban on this server.
+            if os.path.exists(video_path):
+                return video_path, video_title
+    else:
+        print("🐧 Linux/Docker detected, using CLI subprocess for download...")
+        # Get video ID
+        cmd_getid = ["yt-dlp", "--get-id", url]
+        if cookies_path: cmd_getid[1:1] = ["--cookies", cookies_path]
+        
+        result_id = subprocess.run(cmd_getid, capture_output=True, text=True)
+        if result_id.returncode == 0:
+            video_id = result_id.stdout.strip().splitlines()[-1]
+        else:
+            video_id = url.split("/")[-1].split("?")[0]
 
-👇 SOLUTION FOR USER 👇
----------------------------------------------------------------------
-1. Download the video manually to your computer.
-2. Use the 'Upload Video' tab in this app to process it.
----------------------------------------------------------------------
+        # Get video title
+        cmd_gettitle = ["yt-dlp", "--get-title", url]
+        if cookies_path: cmd_gettitle[1:1] = ["--cookies", cookies_path]
+        
+        result_title = subprocess.run(cmd_gettitle, capture_output=True, text=True)
+        if result_title.returncode == 0:
+            video_title = sanitize_filename(result_title.stdout.strip().splitlines()[-1])
+        else:
+            video_title = "Unknown"
+            
+        video_path = os.path.join(output_dir, f"{video_id}.mp4")
+        
+        if os.path.exists(video_path):
+            return video_path, video_title
 
-Technical Details: {str(e)}
-            """
-            # Print to both streams to ensure capture
-            print(error_msg, file=sys.stdout)
-            print(error_msg, file=sys.stderr)
-            
-            # Force flush
-            sys.stdout.flush()
-            sys.stderr.flush()
-            
-            # Wait a split second to allow buffer to drain before raising
-            time.sleep(0.5)
-            
-            raise e
-    
-    output_template = os.path.join(output_dir, f'{sanitized_title}.%(ext)s')
-    expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
-    if os.path.exists(expected_file):
-        os.remove(expected_file)
-        print(f"🗑️  Removed existing file to re-download with H.264 codec")
-    
+        # Full download command with H.264 preference
+        cmd = ["yt-dlp"]
+        if cookies_path: cmd.extend(["--cookies", cookies_path])
+        
+        cmd.extend([
+            "--remote-components", "ejs:github",
+            "-f", quality_format,
+            "--merge-output-format", "mp4",
+            "-o", f"{output_dir}/%(id)s.%(ext)s",
+            url
+        ])
+
+        print(f"   Executing: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"❌ yt-dlp error: {result.stderr}")
+            # Fallback to library if CLI fails
+            return _download_with_library_fallback(url, output_dir, cookies_path, quality_format)
+
+        video_path = os.path.join(output_dir, f"{video_id}.mp4")
+        return video_path, video_title
+
+def _download_with_library_fallback(url, output_dir, cookies_path, quality_format):
+    """Fallback to yt_dlp library if CLI fails."""
     ydl_opts = {
-        **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
-        'outtmpl': output_template,
+        'format': quality_format,
+        'outtmpl': f"{output_dir}/%(id)s.%(ext)s",
         'merge_output_format': 'mp4',
-        'overwrites': True,
+        'cookiefile': cookies_path,
     }
-    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    
-    downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
-    
-    if not os.path.exists(downloaded_file):
-        for f in os.listdir(output_dir):
-            if f.startswith(sanitized_title) and f.endswith('.mp4'):
-                downloaded_file = os.path.join(output_dir, f)
-                break
-    
-    step_end_time = time.time()
-    print(f"✅ Video downloaded in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
-    
-    return downloaded_file, sanitized_title
+        info = ydl.extract_info(url, download=True)
+        return os.path.join(output_dir, f"{info['id']}.mp4"), sanitize_filename(info.get('title', 'Unknown'))
 
-def process_video_to_vertical(input_video, final_output_video):
+def process_video_to_vertical(input_video, final_output_video, skip_analysis=False):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
     """
@@ -592,49 +574,77 @@ def process_video_to_vertical(input_video, final_output_video):
     if os.path.exists(final_output_video): os.remove(final_output_video)
 
     print(f"🎬 Processing clip: {input_video}")
-    print("   Step 1: Detecting scenes...")
-    scenes, fps = detect_scenes(input_video)
     
-    if not scenes:
-        print("   ❌ No scenes were detected. Using full video as one scene.")
-        # If scene detection fails or finds nothing, treat whole video as one scene
-        cap = cv2.VideoCapture(input_video)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        print(f"   ❌ Error: Could not open input video {input_video}. It might be corrupted or in an unsupported format.")
+        return False
+        
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Basic frame read check to detect decoding issues early (like AV1 failure)
+    ret, test_frame = cap.read()
+    if not ret or test_frame is None:
+        print("   ❌ Error: Could not read the first frame. The video stream might be corrupted or codec unsupported (e.g. AV1).")
         cap.release()
+        return False
+    
+    # Reset to start
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    cap.release()
+
+    if skip_analysis:
+        print("   ⏩ Fast Mode: Skipping scene detection and analysis.")
         from scenedetect import FrameTimecode
         scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames, fps))]
+    else:
+        print("   Step 1: Detecting scenes...")
+        scenes, fps = detect_scenes(input_video)
+        
+        if not scenes:
+            print("   ❌ No scenes were detected. Using full video as one scene.")
+            from scenedetect import FrameTimecode
+            scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames, fps))]
 
     print(f"   ✅ Found {len(scenes)} scenes.")
 
     print("\n   🧠 Step 2: Preparing Active Tracking...")
     original_width, original_height = get_video_resolution(input_video)
     
-    OUTPUT_HEIGHT = original_height
-    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
-    if OUTPUT_WIDTH % 2 != 0:
-        OUTPUT_WIDTH += 1
+    # Force Full HD Vertical (1080x1920) for high quality
+    OUTPUT_WIDTH = 1080
+    OUTPUT_HEIGHT = 1920
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height)
     
     # --- New Strategy: Per-Scene Analysis ---
-    print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
-    scene_strategies = analyze_scenes_strategy(input_video, scenes)
-    # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
+    if skip_analysis:
+        scene_strategies = ['TRACK']
+    else:
+        print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
+        scene_strategies = analyze_scenes_strategy(input_video, scenes)
     
     print("\n   ✂️ Step 4: Processing video frames...")
     
     command = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-an', temp_video_output
+        '-r', str(fps), '-i', '-', 
+        '-c:v', 'libx264',
+        '-preset', 'veryslow', # Maximum compression efficiency for detail
+        '-crf', '16',         # Even higher quality (visually perfect)
+        '-pix_fmt', 'yuv420p', # Standard pixel format for mobile/social
+        '-profile:v', 'high', 
+        '-level', '4.2',
+        '-x264-params', 'ref=4:me=umh:subme=8', # Deep motion search for sharpness
+        '-an', temp_video_output
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     cap = cv2.VideoCapture(input_video)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     frame_number = 0
     current_scene_index = 0
@@ -642,7 +652,7 @@ def process_video_to_vertical(input_video, final_output_video):
     # Pre-calculate scene boundaries
     scene_boundaries = []
     for s_start, s_end in scenes:
-        scene_boundaries.append((s_start.get_frames(), s_end.get_frames()))
+        scene_boundaries.append((s_start.frame_num, s_end.frame_num))
 
     # Global tracker for single-person shots
     speaker_tracker = SpeakerTracker(cooldown_frames=30)
@@ -693,11 +703,20 @@ def process_video_to_vertical(input_video, final_output_video):
                 # Crop
                 if y2 > y1 and x2 > x1:
                     cropped = frame[y1:y2, x1:x2]
-                    output_frame = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    # Use INTER_LANCZOS4 for higher quality upscaling/sharpening
+                    output_frame = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
                 else:
-                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
 
-            ffmpeg_process.stdin.write(output_frame.tobytes())
+            try:
+                ffmpeg_process.stdin.write(output_frame.tobytes())
+            except (BrokenPipeError, IOError):
+                print("\n   ❌ FFmpeg crashed during frame processing.")
+                stderr_output = ffmpeg_process.stderr.read().decode()
+                print("   Stderr:", stderr_output)
+                cap.release()
+                return False
+
             frame_number += 1
             pbar.update(1)
     
@@ -722,7 +741,7 @@ def process_video_to_vertical(input_video, final_output_video):
         pass
 
     print("\n   ✨ Step 6: Merging...")
-    if os.path.exists(temp_audio_output):
+    if os.path.exists(temp_audio_output) and os.path.getsize(temp_audio_output) > 0:
         merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output, '-i', temp_audio_output,
             '-c:v', 'copy', '-c:a', 'copy', final_output_video
@@ -799,12 +818,8 @@ def get_viral_clips(transcript_result, video_duration):
         print("❌ Error: GEMINI_API_KEY not found in environment variables.")
         return None
 
-
     client = genai.Client(api_key=api_key)
-    
-    # We use gemini-2.5-flash as requested.
     model_name = 'gemini-2.5-flash' 
-    
     print(f"🤖  Initializing Gemini with model: {model_name}")
 
     # Extract words
@@ -823,65 +838,68 @@ def get_viral_clips(transcript_result, video_duration):
         words_json=json.dumps(words)
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
-        )
-        
-        # --- Cost Calculation ---
+    # Retry Logic for 503 errors (High Demand)
+    max_retries = 3
+    retry_delay = 5 # seconds
+
+    for attempt in range(max_retries):
         try:
-            usage = response.usage_metadata
-            if usage:
-                # Gemini 2.5 Flash Pricing (Dec 2025)
-                # Input: $0.10 per 1M tokens
-                # Output: $0.40 per 1M tokens
-                
-                input_price_per_million = 0.10
-                output_price_per_million = 0.40
-                
-                prompt_tokens = usage.prompt_token_count
-                output_tokens = usage.candidates_token_count
-                
-                input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
-                output_cost = (output_tokens / 1_000_000) * output_price_per_million
-                total_cost = input_cost + output_cost
-                
-                cost_analysis = {
-                    "input_tokens": prompt_tokens,
-                    "output_tokens": output_tokens,
-                    "input_cost": input_cost,
-                    "output_cost": output_cost,
-                    "total_cost": total_cost,
-                    "model": model_name
-                }
-
-                print(f"💰 Token Usage ({model_name}):")
-                print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
-                print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
-                print(f"   - Total Estimated Cost: ${total_cost:.6f}")
-                
-        except Exception as e:
-            print(f"⚠️ Could not calculate cost: {e}")
-            cost_analysis = None
-        # ------------------------
-
-        # Clean response if it contains markdown code blocks
-        text = response.text
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        
-        result_json = json.loads(text)
-        if cost_analysis:
-            result_json['cost_analysis'] = cost_analysis
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
             
-        return result_json
-    except Exception as e:
-        print(f"❌ Gemini Error: {e}")
-        return None
+            # --- Cost Calculation ---
+            try:
+                usage = response.usage_metadata
+                if usage:
+                    input_price_per_million = 0.10
+                    output_price_per_million = 0.40
+                    prompt_tokens = usage.prompt_token_count
+                    output_tokens = usage.candidates_token_count
+                    input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
+                    output_cost = (output_tokens / 1_000_000) * output_price_per_million
+                    total_cost = input_cost + output_cost
+                    
+                    cost_analysis = {
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": output_tokens,
+                        "input_cost": input_cost,
+                        "output_cost": output_cost,
+                        "total_cost": total_cost,
+                        "model": model_name
+                    }
+
+                    print(f"💰 Token Usage ({model_name}):")
+                    print(f"   - Total Estimated Cost: ${total_cost:.6f}")
+            except:
+                cost_analysis = None
+
+            # Clean response and extract JSON robustly using regex
+            text = response.text.strip()
+            json_match = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_match:
+                text = json_match.group(0)
+            
+            result_json = json.loads(text)
+            if cost_analysis:
+                result_json['cost_analysis'] = cost_analysis
+                
+            return result_json
+
+        except Exception as e:
+            error_str = str(e)
+            if "503" in error_str or "UNAVAILABLE" in error_str:
+                print(f"⚠️  Gemini is busy (503). Retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay *= 2 # Exponential backoff
+                continue
+            else:
+                print(f"❌ Gemini Error: {e}")
+                return None
+    
+    print("❌ Gemini is still unavailable after multiple retries.")
+    return None
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
@@ -893,6 +911,7 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
+    parser.add_argument('--test', action='store_true', help="Test mode: only process the first 30 seconds.")
     
     args = parser.parse_args()
 
@@ -904,31 +923,24 @@ if __name__ == '__main__':
             os.makedirs(path, exist_ok=True)
         return path
     
-    # 1. Get Input Video
+    # 1. Handle Input Video
     if args.url:
-        # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
-        # For whole-video runs (--skip-analysis), --output can be a file path.
         if args.output and not args.skip_analysis:
             output_dir = _ensure_dir(args.output)
         else:
-            # If output is a directory, use it; if it's a filename, use its directory; else default "."
             if args.output and os.path.isdir(args.output):
                 output_dir = args.output
             elif args.output and not os.path.isdir(args.output):
                 output_dir = os.path.dirname(args.output) or "."
             else:
                 output_dir = "."
-        
         input_video, video_title = download_youtube_video(args.url, output_dir)
     else:
         input_video = args.input
         video_title = os.path.splitext(os.path.basename(input_video))[0]
-        
         if args.output and not args.skip_analysis:
-            # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
             output_dir = _ensure_dir(args.output)
         else:
-            # If output is a directory, use it; if it's a filename, use its directory; else default to input dir.
             if args.output and os.path.isdir(args.output):
                 output_dir = args.output
             elif args.output and not os.path.isdir(args.output):
@@ -940,13 +952,42 @@ if __name__ == '__main__':
         print(f"❌ Input file not found: {input_video}")
         exit(1)
 
-    # 2. Decision: Analyze clips or process whole?
+    # 2. IMMEDIATE BYPASS FOR TEST MODE
+    if args.test:
+        print("🧪 Test mode: Cutting the first 30 seconds immediately...")
+        if args.output and os.path.isdir(args.output):
+            output_file = os.path.join(args.output, f"{video_title}_test_vertical.mp4")
+        else:
+            output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_test_vertical.mp4")
+        
+        test_temp_path = os.path.join(output_dir, f"test_cut_{video_title}.mp4")
+        
+        # Fast 30s cut
+        cut_cmd = [
+            'ffmpeg', '-y', '-ss', '0', '-t', '30', '-i', input_video,
+            '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-c:a', 'aac',
+            test_temp_path
+        ]
+        subprocess.run(cut_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        
+        # Process vertical skipping all analysis
+        process_video_to_vertical(test_temp_path, output_file, skip_analysis=True)
+        
+        if os.path.exists(test_temp_path): os.remove(test_temp_path)
+        
+        # CLEANUP & EXIT for test mode
+        if args.url and not args.keep_original and os.path.exists(input_video):
+            os.remove(input_video)
+        print(f"\n⏱️  Test execution time: {time.time() - script_start_time:.2f}s")
+        sys.exit(0)
+
+    # 3. Decision for normal/skip-analysis modes
     if args.skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
         output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
         process_video_to_vertical(input_video, output_file)
     else:
-        # 3. Transcribe
+        # Normal flow (Transcript -> Gemini -> Clipping)
         transcript = transcribe_video(input_video)
         
         # Get duration

@@ -43,6 +43,13 @@ Complete free AI YouTube toolkit: thumbnails, titles, descriptions, and direct p
 
 ![YouTube Studio](screenshots/youtube-studio.png)
 
+### 4. Telegram Bot (New!)
+Generate shorts directly from Telegram. Just send a YouTube link to your bot, and it will process and send the clips back to you.
+
+- **Instant Processing**: Send any YouTube URL and get viral clips in minutes.
+- **Mobile-Friendly**: Manage your shorts creation on the go.
+- **Direct Delivery**: Clips are sent as video messages directly in the chat.
+
 - AI thumbnail generator with face overlay
 - 10 viral title suggestions with refinement chat
 - Auto-generated descriptions with chapter timestamps
